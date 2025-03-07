@@ -353,11 +353,13 @@ class ArtCurator(BaseDiscordBot):
                                                 # Refetch message to ensure it's still valid
                                                 message = await channel.fetch_message(message_id)
                                                 # Check again for either reaction in case one was added during the delay
-                                                has_either_reaction = any(
-                                                    (str(reaction.emoji) in ['💌', '📥'] and 
-                                                    any(user.id == self.user.id async for user in reaction.users()))
-                                                    for reaction in message.reactions
-                                                )
+                                                has_either_reaction = False
+                                                for reaction in message.reactions:
+                                                    if str(reaction.emoji) in ['💌', '📥']:
+                                                        users = [user async for user in reaction.users()]
+                                                        if any(user.id == self.user.id for user in users):
+                                                            has_either_reaction = True
+                                                            break
                                                 if not has_either_reaction:
                                                     await message.add_reaction('📥')
                                                     self.logger.info(f"Added delayed inbox tray reaction to message from {message.author}.")
@@ -385,11 +387,13 @@ class ArtCurator(BaseDiscordBot):
                                         try:
                                             message = await channel.fetch_message(message_id)
                                             # Check again for either reaction in case one was added during the delay
-                                            has_either_reaction = any(
-                                                (str(reaction.emoji) in ['💌', '📥'] and 
-                                                any(user.id == self.user.id async for user in reaction.users()))
-                                                for reaction in message.reactions
-                                            )
+                                            has_either_reaction = False
+                                            for reaction in message.reactions:
+                                                if str(reaction.emoji) in ['💌', '📥']:
+                                                    users = [user async for user in reaction.users()]
+                                                    if any(user.id == self.user.id for user in users):
+                                                        has_either_reaction = True
+                                                        break
                                             if not has_either_reaction:
                                                 await message.add_reaction('📥')
                                                 self.logger.info(f"Added delayed inbox tray reaction to untracked message from {message.author}.")
