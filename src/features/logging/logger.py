@@ -101,6 +101,11 @@ class MessageLogger(BaseDiscordBot):
             except Exception as e:
                 logger.debug(f"Error getting display name for user {message.author.id}: {e}")
             
+            # Get category ID if available
+            category_id = None
+            if hasattr(message.channel, 'category') and message.channel.category:
+                category_id = message.channel.category.id
+            
             return {
                 'id': message.id,
                 'message_id': message.id,
@@ -130,7 +135,8 @@ class MessageLogger(BaseDiscordBot):
                 'jump_url': message.jump_url,
                 'is_deleted': False,  # Messages are not deleted when first created
                 'display_name': display_name,  # Server nickname or display name
-                'global_name': global_name  # Global display name
+                'global_name': global_name,  # Global display name
+                'category_id': category_id
             }
         except Exception as e:
             logger.error(f"Error preparing message data: {e}")

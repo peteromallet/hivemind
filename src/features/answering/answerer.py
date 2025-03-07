@@ -130,60 +130,33 @@ class SearchAnswerBot(BaseDiscordBot):
 
     async def determine_relevant_channels(self, question: str, channels: Dict[int, str], search_info: Dict) -> List[int]:
         """Ask Claude which channels are most relevant for the search."""
-        
-        # Add debug logging
-        logging.info(f"\nDetermining relevant channels for question: {question}")
-        logging.info(f"Available channels for search: {len(channels)}")
-        
-        # Format channels for Claude
-        channel_list = "\n".join([f"- #{name} (ID: {id})" for id, name in channels.items()])
-        
-        prompt = f"""You are a Discord channel search assistant. Given this question, identify the most relevant Discord channels for finding information. VERY IMPORTANT: Don't include ANYTHING other than the json array of channel IDs. 
+        prompt = f"""Given this question and list of Discord channels, return ONLY the channel IDs that are most relevant for finding the answer.
+Format as a JSON list of integers. Example: [123456789, 987654321]
 
 Question: {question}
 
 Available channels:
-{channel_list}
+{json.dumps(channels, indent=2)}
 
-Channel Selection Priority:
-1. If the question mentions a specific product/tool (e.g., Hunyuan, ComfyUI, etc):
-   - ALWAYS start with that product's dedicated channels (e.g., hunyuanvideo_chatter, comfyui)
-   - If there's only one product-specific channel - like liveportrait, or liveportrait - use it 
-   - Only add general channels if no product-specific channels exist
-
-2. For general questions (no specific product mentioned):
-   - Start with broader discussion channels
-   - Add relevant technical channels if the question is technical
-
-3. When choosing between multiple product-specific channels:
-   - Prefer 'chatter' channels for broad questions
-   - Prefer 'technical' variants for setup/configuration questions
-   - Include both if the question spans both areas
-
-Examples:
-"How much RAM does Hunyuan need?" -> [hunyuanvideo_chatter]
-"How can I reduce jitter with liveportrait?" -> [liveportrait]
-"I'm getting a triton error when launching Comfy" -> [comfyui]
-"What are good video upscalers?" -> [art_chatter,comfyui]
-"How can I do unsampling with LTVX?" -> [ltxv]
-
-Return ONLY a JSON array of channel IDs. Example: [123456789] or [123456789, 987654321]
-
-Remember: Product-specific channels should ALWAYS be included when the product is mentioned in the question.
-
-VERY IMPORTANT: Don't include ANYTHING other than the json array of channel IDs."""
+Return ONLY the list of relevant channel IDs, nothing else."""
 
         input_tokens = len(prompt.split())
         
         try:
-            response = self.claude.messages.create(
-                model="claude-3-5-haiku-latest",
-                max_tokens=500,
-                messages=[{
-                    "role": "user",
-                    "content": prompt
-                }]
-            )
+            # Run the blocking Claude API call in a thread pool
+            loop = asyncio.get_running_loop()
+            
+            def call_claude():
+                return self.claude.messages.create(
+                    model="claude-3-5-haiku-latest",
+                    max_tokens=500,
+                    messages=[{
+                        "role": "user",
+                        "content": prompt
+                    }]
+                )
+            
+            response = await loop.run_in_executor(None, call_claude)
             
             output_tokens = len(response.content[0].text.split())
             input_cost = (input_tokens / 1000000) * 0.80
@@ -199,43 +172,23 @@ VERY IMPORTANT: Don't include ANYTHING other than the json array of channel IDs.
             response_text = response.content[0].text.strip()
             logging.debug(f"Claude response: {response_text}")
             
+            # Try to parse as JSON
             try:
                 channel_ids = json.loads(response_text)
-                valid_ids = [cid for cid in channel_ids if cid in channels]
-                
-                # If no valid channels found, fall back to a relevant default
-                if not valid_ids:
-                    # Find most relevant channel based on question keywords
-                    keywords = question.lower().split()
-                    for cid, name in channels.items():
-                        if any(keyword in name.lower() for keyword in keywords):
-                            valid_ids = [cid]
-                            break
-                    
-                    # If still nothing found, use general channel
-                    if not valid_ids:
-                        general_channels = [cid for cid, name in channels.items() 
-                                         if 'general' in name.lower()]
-                        if general_channels:
-                            valid_ids = [general_channels[0]]
-                
-                # Log the selected channels
-                selected_channels = [(cid, channels[cid]) for cid in valid_ids]
-                logging.info(f"Selected channels for search: {selected_channels}")
-                
-                search_info['channel_selection_tokens'] = input_tokens + output_tokens
-                search_info['channel_selection_cost'] = total_cost
-                
-                return valid_ids
-                
-            except json.JSONDecodeError as e:
-                logging.error(f"Error parsing Claude response as JSON: {e}")
-                logging.debug(f"Raw response: {response_text}")
-                # Fall back to most relevant channel
-                fallback_channel = next((cid for cid, name in channels.items() 
-                                       if 'general' in name.lower()), None)
-                return [fallback_channel] if fallback_channel else []
-                
+                if isinstance(channel_ids, list):
+                    # Filter to only valid channel IDs
+                    valid_ids = [cid for cid in channel_ids if cid in channels]
+                    if valid_ids:
+                        search_info['channel_selection_tokens'] = input_tokens + output_tokens
+                        search_info['channel_selection_cost'] = total_cost
+                        return valid_ids
+            except json.JSONDecodeError:
+                logging.error("Failed to parse Claude response as JSON")
+            
+            # If we get here, something went wrong with the response
+            logging.error("Invalid response format from Claude")
+            return list(channels.keys())[:3]  # Return first 3 channels as fallback
+            
         except Exception as e:
             logging.error(f"Error determining relevant channels: {e}")
             return []
@@ -262,56 +215,50 @@ VERY IMPORTANT: Don't include ANYTHING other than the json array of channel IDs.
         
         input_tokens = len(system_prompt.split()) + len(question.split())
         
-        response = self.claude.messages.create(
-            model="claude-3-5-haiku-latest",
-            max_tokens=500,
-            messages=[{
-                "role": "user",
-                "content": system_prompt + question
-            }]
-        )
-        
-        output_tokens = len(response.content[0].text.split())
-        input_cost = (input_tokens / 1000000) * 0.80
-        output_cost = (output_tokens / 1000000) * 4.00
-        total_cost = input_cost + output_cost
-        
-        logging.info(f"\nQuery Generation API Usage:")
-        logging.info(f"Input tokens: {input_tokens:,}")
-        logging.info(f"Output tokens: {output_tokens:,}")
-        logging.info(f"Estimated cost: ${total_cost:.6f}")
-        
         try:
-            response_text = response.content[0].text
-            match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if match:
-                queries = json.loads(match.group())
-                
-                # Clean up queries - remove channel-specific terms
-                cleaned_queries = []
-                channel_terms = ['hunyuan', 'comfy', 'sd', 'stable diffusion']
-                
-                for q in queries:
-                    query = q['query'].lower()
-                    # Skip queries that are just channel terms
-                    if query in channel_terms:
-                        continue
-                    # Remove channel terms from queries
-                    for term in channel_terms:
-                        query = query.replace(term + ' ', '')
-                        query = query.replace(' ' + term, '')
-                    q['query'] = query.strip()
-                    if q['query']:  # Only add if query isn't empty
-                        cleaned_queries.append(q)
-                
-                logging.info(f"Generated queries: {cleaned_queries}")
-                search_info['query_generation_tokens'] = input_tokens + output_tokens
-                search_info['query_generation_cost'] = total_cost
-                return cleaned_queries
-            return []
+            # Run the blocking Claude API call in a thread pool
+            loop = asyncio.get_running_loop()
+            
+            def call_claude():
+                return self.claude.messages.create(
+                    model="claude-3-5-haiku-latest",
+                    max_tokens=500,
+                    messages=[{
+                        "role": "user",
+                        "content": system_prompt + question
+                    }]
+                )
+            
+            response = await loop.run_in_executor(None, call_claude)
+            
+            output_tokens = len(response.content[0].text.split())
+            input_cost = (input_tokens / 1000000) * 0.80
+            output_cost = (output_tokens / 1000000) * 4.00
+            total_cost = input_cost + output_cost
+            
+            logging.info(f"\nQuery Generation API Usage:")
+            logging.info(f"Input tokens: {input_tokens:,}")
+            logging.info(f"Output tokens: {output_tokens:,}")
+            logging.info(f"Estimated cost: ${total_cost:.6f}")
+            
+            search_info['query_generation_tokens'] = input_tokens + output_tokens
+            search_info['query_generation_cost'] = total_cost
+            
+            # Try to parse as JSON
+            try:
+                queries = json.loads(response.content[0].text.strip())
+                if isinstance(queries, list):
+                    return queries
+            except json.JSONDecodeError:
+                logging.error("Failed to parse Claude response as JSON")
+            
+            # If we get here, something went wrong with the response
+            logging.error("Invalid response format from Claude")
+            return [{"query": question, "reason": "Fallback to original question"}]
+            
         except Exception as e:
-            logging.error(f"Error parsing queries: {e}")
-            return []
+            logging.error(f"Error generating search queries: {e}")
+            return [{"query": question, "reason": "Error occurred, using original question"}]
 
     async def search_channels(self, query: str, channels: List[int], limit: int = None) -> List[discord.Message]:
         """Search for messages in specified channels using archived data first."""
@@ -432,14 +379,20 @@ Answer:"""
             # Calculate input tokens
             input_tokens = len(prompt.split())  # Simple approximation
             
-            response = self.claude.messages.create(
-                model="claude-3-5-haiku-latest",
-                max_tokens=1500,
-                messages=[{
-                    "role": "user",
-                    "content": prompt
-                }]
-            )
+            # Run the blocking Claude API call in a thread pool
+            loop = asyncio.get_running_loop()
+            
+            def call_claude():
+                return self.claude.messages.create(
+                    model="claude-3-5-haiku-latest",
+                    max_tokens=1500,
+                    messages=[{
+                        "role": "user",
+                        "content": prompt
+                    }]
+                )
+            
+            response = await loop.run_in_executor(None, call_claude)
             
             # Calculate output tokens and costs
             output_tokens = len(response.content[0].text.split())  # Simple approximation

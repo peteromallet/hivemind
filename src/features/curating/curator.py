@@ -127,7 +127,13 @@ class ArtCurator(BaseDiscordBot):
                     'vimeo.com',                  # Vimeo
                     'tiktok.com',                 # TikTok
                     'streamable.com',             # Streamable
-                    'twitch.tv'                   # Twitch
+                    'twitch.tv',                  # Twitch
+                    'fixupx.com',                 # FixupX
+                    'fxtwitter.com',              # Twitter Embed Fixes
+                    'vxtwitter.com',
+                    'twittpr.com',
+                    'ddinstagram.com',            # Instagram Embed Fix
+                    'rxddit.com'                  # Reddit Embed Fix
                 ]
 
                 # Check if attachments are valid media files
@@ -192,10 +198,21 @@ class ArtCurator(BaseDiscordBot):
                                     notification_msg = (
                                         f"Hi {message.author.mention},\n\n"
                                         "You posted a link to art sharing that didn't seem like it would embed a video on Discord. "
-                                        "For the sake of the Discord viewing experience, we hide these.\n\n"
+                                        "For the sake of the Discord viewing experience, we hide these links.\n\n"
                                         "If you meant to post a video, please share a link to a platform that embeds links on Discord (YT, etc.) or a file "
                                         "- alongside a non-embedding link if you like!\n\n"
-                                        "Love,\n\nBNDC"
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                        "YouTube, TikTok, and Vimeo links embed natively, but some other popular services don't.\n\n"
+                                        "Below are some services that allow you to embed links by using them instead of the original domain:\n\n"
+                                        "• Reddit: rxddit.com\n"
+                                        "• Instagram: ddinstagram.com\n"
+                                        "• Twitter: fixupx.com\n\n"
+                                        "Example of using a mirror link:\n"
+                                        "Instead of: https://reddit.com/r/news/comments/123abc\n"
+                                        "Use: https://rxddit.com/r/news/comments/123abc\n\n"
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                        "Love,\n"
+                                        "BNDC"
                                     )
                                     try:
                                         await message.author.send(notification_msg)
@@ -279,7 +296,13 @@ class ArtCurator(BaseDiscordBot):
                         'vimeo.com',                  # Vimeo
                         'tiktok.com',                 # TikTok
                         'streamable.com',             # Streamable
-                        'twitch.tv'                   # Twitch
+                        'twitch.tv',                  # Twitch
+                        'fixupx.com',                 # FixupX
+                        'fxtwitter.com',              # Twitter Embed Fixes
+                        'vxtwitter.com',
+                        'twittpr.com',
+                        'ddinstagram.com',            # Instagram Embed Fix
+                        'rxddit.com'                  # Reddit Embed Fix
                     ]
                     
                     links = [word for word in message.content.split() 

@@ -79,9 +79,12 @@ class BaseDiscordBot(commands.Bot):
     async def setup_hook(self):
         """Called before the bot starts running. This is the proper place for async init."""
         try:
+            # Get the event loop
+            loop = asyncio.get_running_loop()
+            
             # Start health check task
             if not self._health_check_task:
-                self._health_check_task = asyncio.create_task(self._run_health_checks())
+                self._health_check_task = loop.create_task(self._run_health_checks())
         except Exception as e:
             self.logger.error(f"Error in setup_hook: {e}")
             raise

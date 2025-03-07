@@ -15,6 +15,7 @@ import json
 from typing import Dict, List, Optional
 import logging
 from src.common.db_handler import DatabaseHandler
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -110,46 +111,48 @@ Recent messages from #{channel_data['name']}:
 {chr(10).join(messages)}"""
 
             logger.info("Sending request to Claude...")
-            response = self.claude.messages.create(
-                model="claude-3-5-sonnet-latest",
-                max_tokens=1000,
-                messages=[{
-                    "role": "user",
-                    "content": prompt
-                }]
-            )
+            
+            # Run the blocking Claude API call in a thread pool
+            loop = asyncio.get_running_loop()
+            
+            def call_claude():
+                return self.claude.messages.create(
+                    model="claude-3-5-sonnet-latest",
+                    max_tokens=1000,
+                    messages=[{
+                        "role": "user",
+                        "content": prompt
+                    }]
+                )
+            
+            response = await loop.run_in_executor(None, call_claude)
             logger.info("Received response from Claude")
 
             # Sanitize the response text before parsing JSON
             response_text = response.content[0].text.strip()
             
             try:
-                # Use json.loads with strict=False to handle newlines in strings
-                return json.loads(response_text, strict=False)
+                # Parse the JSON response
+                description = json.loads(response_text)
+                return description
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Claude's response as JSON: {e}")
+                logger.error(f"Error parsing Claude response as JSON: {e}")
                 logger.error(f"Raw response: {response_text}")
+                return {
+                    "description": "Error parsing channel description",
+                    "suitable_posts": "• Unable to determine",
+                    "unsuitable_posts": "• Unable to determine",
+                    "rules": "• Unable to determine"
+                }
                 
-                # Fallback: Try to clean up newlines in the response
-                try:
-                    # Replace newlines in the values but keep the JSON structure
-                    cleaned_text = response_text.replace('\n', '\\n')
-                    return json.loads(cleaned_text)
-                except json.JSONDecodeError:
-                    return {
-                        "description": "Error: Invalid response format from Claude",
-                        "suitable_posts": "",
-                        "unsuitable_posts": "",
-                        "rules": ""
-                    }
-
         except Exception as e:
-            logger.error(f"Error getting description for channel #{channel_data['name']}: {e}")
+            logger.error(f"Error getting channel description: {e}")
+            logger.error(traceback.format_exc())
             return {
-                "description": f"Error analyzing channel: {str(e)}",
-                "suitable_posts": "",
-                "unsuitable_posts": "",
-                "rules": ""
+                "description": "Error getting channel description",
+                "suitable_posts": "• Unable to determine",
+                "unsuitable_posts": "• Unable to determine",
+                "rules": "• Unable to determine"
             }
 
 async def main():

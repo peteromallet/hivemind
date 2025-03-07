@@ -15,6 +15,10 @@ import json
 from src.common.db_handler import DatabaseHandler
 from src.common.constants import get_database_path
 from src.common.base_bot import BaseDiscordBot
+from src.common.rate_limiter import RateLimiter
+import threading
+import queue
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -27,13 +31,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Thread-local storage for database connections
+thread_local = threading.local()
+
+def get_db(db_path):
+    """Get thread-local database connection."""
+    if not hasattr(thread_local, "db"):
+        thread_local.db = DatabaseHandler(db_path)
+        thread_local.db._init_db()
+    return thread_local.db
+
 class MessageArchiver(BaseDiscordBot):
     def __init__(self, dev_mode=False, order="newest", days=None, batch_size=500, in_depth=False, channel_id=None):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         intents.members = True
-        intents.messages = True  # This is the correct attribute for message history
+        intents.messages = True
         intents.reactions = True
         super().__init__(
             command_prefix="!",
@@ -49,7 +63,9 @@ class MessageArchiver(BaseDiscordBot):
         
         # Set database path based on mode
         self.db_path = get_database_path(dev_mode)
-        self.db = None
+        
+        # Create a queue for database operations
+        self.db_queue = queue.Queue()
         
         # Track total messages archived
         self.total_messages_archived = 0
@@ -102,42 +118,249 @@ class MessageArchiver(BaseDiscordBot):
         self.last_api_call = datetime.now()
         self.api_call_count = 0
         self.rate_limit_reset = datetime.now()
-        self.rate_limit_remaining = 50  # Conservative initial limit
+        self.rate_limit_remaining = 50
+        
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter()
+        
+        # Add member update cache
+        self.member_update_cache = {}
+        self.member_update_cache_timeout = 300  # 5 minutes
+        
+        # Start database worker thread
+        self.db_thread = threading.Thread(target=self._db_worker, daemon=True)
+        self.db_thread.start()
+
+    def _db_worker(self):
+        """Worker thread for database operations."""
+        db = get_db(self.db_path)
+        while True:
+            try:
+                # Get the next operation from the queue
+                operation = self.db_queue.get()
+                if operation is None:
+                    break
+                
+                # Execute the operation
+                func, args, kwargs, future = operation
+                try:
+                    result = func(db, *args, **kwargs)
+                    # Only try to set result if the future is not done
+                    if not future.done():
+                        try:
+                            # Create a callback to set the result in the event loop
+                            def set_result_callback():
+                                if not future.done():
+                                    future.set_result(result)
+                            self.loop.call_soon_threadsafe(set_result_callback)
+                        except Exception as e:
+                            logger.error(f"Error setting future result: {e}")
+                except Exception as exception:
+                    # Only try to set exception if the future is not done
+                    if not future.done():
+                        try:
+                            # Create a callback to set the exception in the event loop
+                            # Capture the exception in the closure
+                            def set_exception_callback(e=exception):
+                                if not future.done():
+                                    future.set_exception(e)
+                            self.loop.call_soon_threadsafe(set_exception_callback)
+                        except Exception as e:
+                            logger.error(f"Error setting future exception: {e}")
+                
+                self.db_queue.task_done()
+            except Exception as e:
+                logger.error(f"Error in database worker: {e}")
+                continue
+
+    async def _db_operation(self, func, *args, **kwargs):
+        """Execute a database operation in the worker thread."""
+        # Make sure we have an event loop
+        if not self.loop or self.loop.is_closed():
+            self.loop = asyncio.get_event_loop()
+        
+        future = self.loop.create_future()
+        self.db_queue.put((func, args, kwargs, future))
+        try:
+            return await future
+        except Exception as e:
+            logger.error(f"Error in database operation: {e}")
+            raise
 
     async def setup_hook(self):
         """Setup hook to initialize database and start archiving."""
         try:
-            # Create fresh connection when starting up
-            self.db = DatabaseHandler(self.db_path)
-            self.db.init_db()
+            # Initialize database in the worker thread
+            await self._db_operation(lambda db: None)
             logger.info("Database initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             raise
 
-    def _ensure_db_connection(self):
-        """Ensure database connection is alive and reconnect if needed."""
+    async def _process_message(self, message, channel_id):
+        """Process a single message and store it in the database."""
         try:
-            # Test the connection
-            if not self.db or not self.db.conn:
-                logger.info("Database connection lost, reconnecting...")
-                self.db = DatabaseHandler(self.db_path)
-                self.db.init_db()
-                logger.info("Successfully reconnected to database")
-            else:
-                # Test if connection is actually working
-                self.db.cursor.execute("SELECT 1")
+            message_start_time = datetime.now()
+            
+            # Calculate total reaction count and get reactors
+            reaction_count = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
+            reactors = []
+            
+            if reaction_count > 0 and message.reactions:
+                reaction_start_time = datetime.now()
+                reactor_ids = set()
+                try:
+                    message_exists = await self._db_operation(
+                        lambda db: db.message_exists(message.id)
+                    )
+                    if self.in_depth or not message_exists:
+                        logger.info(f"Processing reactions for message {message.id}: {len(message.reactions)} types, {reaction_count} total reactions")
+                        
+                        guild = self.get_guild(self.guild_id)
+                        
+                        for reaction in message.reactions:
+                            reaction_process_start = datetime.now()
+                            try:
+                                async def fetch_users():
+                                    async for user in reaction.users(limit=50):
+                                        reactor_ids.add(user.id)
+                                        # Check if we've recently updated this member
+                                        cache_key = f"{user.id}_{user.name}"
+                                        cache_time = self.member_update_cache.get(cache_key, 0)
+                                        current_time = time.time()
+                                        
+                                        if current_time - cache_time > self.member_update_cache_timeout:
+                                            member = guild.get_member(user.id) if guild else None
+                                            role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
+                                            guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
+                                            
+                                            await self._db_operation(
+                                                lambda db: db.create_or_update_member(
+                                                    user.id,
+                                                    user.name,
+                                                    getattr(user, 'display_name', None),
+                                                    getattr(user, 'global_name', None),
+                                                    str(user.avatar.url) if user.avatar else None,
+                                                    getattr(user, 'discriminator', None),
+                                                    getattr(user, 'bot', False),
+                                                    getattr(user, 'system', False),
+                                                    getattr(user, 'accent_color', None),
+                                                    str(user.banner.url) if getattr(user, 'banner', None) else None,
+                                                    user.created_at.isoformat() if hasattr(user, 'created_at') else None,
+                                                    guild_join_date,
+                                                    role_ids
+                                                )
+                                            )
+                                            # Update cache
+                                            self.member_update_cache[cache_key] = current_time
+                                
+                                await self.rate_limiter.execute(f"reaction_{message.id}_{reaction}", fetch_users)
+                                
+                            except Exception as e:
+                                logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
+                                continue
+                        
+                        if reactor_ids:
+                            reactors = list(reactor_ids)
+                except Exception as e:
+                    logger.warning(f"Could not fetch reactors for message {message.id}: {e}")
+            
+            # Process the message author with caching
+            if hasattr(message.author, 'id'):
+                cache_key = f"{message.author.id}_{message.author.name}"
+                cache_time = self.member_update_cache.get(cache_key, 0)
+                current_time = time.time()
+                
+                if current_time - cache_time > self.member_update_cache_timeout:
+                    guild = self.get_guild(self.guild_id)
+                    member = guild.get_member(message.author.id) if guild else None
+                    role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
+                    guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
+                    
+                    await self._db_operation(
+                        lambda db: db.create_or_update_member(
+                            message.author.id,
+                            message.author.name,
+                            getattr(message.author, 'display_name', None),
+                            getattr(message.author, 'global_name', None),
+                            str(message.author.avatar.url) if message.author.avatar else None,
+                            getattr(message.author, 'discriminator', None),
+                            getattr(message.author, 'bot', False),
+                            getattr(message.author, 'system', False),
+                            getattr(message.author, 'accent_color', None),
+                            str(message.author.banner.url) if getattr(message.author, 'banner', None) else None,
+                            message.author.created_at.isoformat() if hasattr(message.author, 'created_at') else None,
+                            guild_join_date,
+                            role_ids
+                        )
+                    )
+                    # Update cache
+                    self.member_update_cache[cache_key] = current_time
+
+            # Get the actual channel ID and name (use parent forum for threads)
+            actual_channel = message.channel
+            thread_id = None
+            
+            if hasattr(message.channel, 'parent') and message.channel.parent:
+                actual_channel = message.channel.parent
+                if isinstance(message.channel, discord.Thread) and not hasattr(message.channel, 'thread_type'):
+                    thread_id = message.channel.id
+                elif hasattr(message.channel, 'thread_type'):
+                    actual_channel = message.channel
+
+            # Create or update the channel
+            category_id = None
+            if hasattr(actual_channel, 'category') and actual_channel.category:
+                category_id = actual_channel.category.id
+
+            await self._db_operation(
+                lambda db: db.create_or_update_channel(
+                    channel_id=actual_channel.id,
+                    channel_name=actual_channel.name,
+                    nsfw=getattr(actual_channel, 'nsfw', False),
+                    category_id=category_id
+                )
+            )
+            
+            processed_message = {
+                'message_id': message.id,
+                'channel_id': actual_channel.id,
+                'author_id': message.author.id,
+                'content': message.content,
+                'created_at': message.created_at.isoformat(),
+                'attachments': [
+                    {
+                        'url': attachment.url,
+                        'filename': attachment.filename
+                    } for attachment in message.attachments
+                ],
+                'embeds': [embed.to_dict() for embed in message.embeds],
+                'reaction_count': reaction_count,
+                'reactors': reactors,
+                'reference_id': message.reference.message_id if message.reference else None,
+                'edited_at': message.edited_at.isoformat() if message.edited_at else None,
+                'is_pinned': message.pinned,
+                'thread_id': thread_id,
+                'message_type': str(message.type),
+                'flags': message.flags.value,
+                'jump_url': message.jump_url
+            }
+            
+            return processed_message
+            
         except Exception as e:
-            logger.warning(f"Database connection test failed, reconnecting: {e}")
-            try:
-                if self.db:
-                    self.db.close()
-                self.db = DatabaseHandler(self.db_path)
-                self.db.init_db()
-                logger.info("Successfully reconnected to database")
-            except Exception as e:
-                logger.error(f"Failed to reconnect to database: {e}")
-                raise
+            logger.error(f"Error processing message {message.id}: {e}")
+            return None
+
+    async def close(self):
+        """Properly close the bot and database connection."""
+        try:
+            # Signal database worker to stop
+            self.db_queue.put(None)
+            self.db_thread.join()
+            await super().close()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
     async def on_ready(self):
         """Called when bot is ready."""
@@ -256,9 +479,6 @@ class MessageArchiver(BaseDiscordBot):
                 logger.info(f"Skipping welcome channel {channel_id}")
                 return
             
-            # Ensure DB connection is healthy
-            self._ensure_db_connection()
-            
             channel = self.get_channel(channel_id)
             if not channel:
                 logger.error(f"Could not find channel {channel_id}")
@@ -274,8 +494,10 @@ class MessageArchiver(BaseDiscordBot):
             
             logger.info(f"Starting archive of #{channel.name} at {channel_start_time}")
             
-            # Initialize message counter for truly new messages
+            # Initialize counters here so they're available in all branches
+            message_counter = 0
             new_message_count = 0
+            batch = []
             
             # Calculate the cutoff date if days limit is set
             cutoff_date = None
@@ -290,7 +512,9 @@ class MessageArchiver(BaseDiscordBot):
             
             try:
                 # Get date range of archived messages
-                earliest_date, latest_date = self.db.get_message_date_range(channel_id)
+                earliest_date, latest_date = await self._db_operation(
+                    lambda db: db.get_message_date_range(channel_id)
+                )
                 # Make sure dates are timezone-aware
                 if earliest_date:
                     earliest_date = earliest_date.replace(tzinfo=timezone.utc)
@@ -301,17 +525,12 @@ class MessageArchiver(BaseDiscordBot):
             except Exception as e:
                 logger.warning(f"Could not get message date range, will fetch all messages: {e}")
             
-            message_count = 0
-            batch = []
-            
             # If no archived messages exist or we're in in-depth mode, get all messages in the time range
             if not earliest_date or not latest_date or self.in_depth:
                 if self.in_depth:
                     logger.info(f"In-depth mode: Re-checking all messages in time range for #{channel.name}")
                 else:
                     logger.info(f"No existing archives found for #{channel.name}. Getting all messages...")
-                
-                message_counter = 0
                 logger.info(f"Starting message fetch for #{channel.name} from {'oldest to newest' if self.oldest_first else 'newest to oldest'}...")
                 try:
                     # We'll paginate through messages using before/after
@@ -345,7 +564,10 @@ class MessageArchiver(BaseDiscordBot):
                                     
                                     # In in-depth mode, always process the message
                                     # In normal mode, only process if not already in DB
-                                    if self.in_depth or not self.db.message_exists(message.id):
+                                    message_exists = await self._db_operation(
+                                        lambda db: db.message_exists(message.id)
+                                    )
+                                    if self.in_depth or not message_exists:
                                         current_batch.append(message)
                                     
                                     # Store batch when it reaches the threshold
@@ -359,12 +581,16 @@ class MessageArchiver(BaseDiscordBot):
                                             
                                             if processed_messages:
                                                 # Only increment counter for messages that didn't exist before
-                                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                                pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                                    lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                                ))
+                                                new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                                 new_message_count += len(new_messages)
                                                 
                                                 logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                                                self.db.store_messages(processed_messages)
+                                                await self._db_operation(
+                                                    lambda db: db.store_messages(processed_messages)
+                                                )
                                             
                                             current_batch = []
                                             await asyncio.sleep(0.1)
@@ -395,12 +621,16 @@ class MessageArchiver(BaseDiscordBot):
                                 
                                 if processed_messages:
                                     # Only increment counter for messages that didn't exist before
-                                    pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                    new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                    pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                        lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                    ))
+                                    new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                     new_message_count += len(new_messages)
                                     
                                     logger.info(f"Storing final batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                                    self.db.store_messages(processed_messages)
+                                    await self._db_operation(
+                                        lambda db: db.store_messages(processed_messages)
+                                    )
                             except Exception as e:
                                 logger.error(f"Failed to store final batch: {e}")
                                 logger.error(f"Error details: {str(e)}")
@@ -449,12 +679,16 @@ class MessageArchiver(BaseDiscordBot):
                             
                             if processed_messages:
                                 # Only increment counter for messages that didn't exist before
-                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                    lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                ))
+                                new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                 new_message_count += len(new_messages)
                                 
                                 logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                                self.db.store_messages(processed_messages)
+                                await self._db_operation(
+                                    lambda db: db.store_messages(processed_messages)
+                                )
                             current_batch = []
                             await asyncio.sleep(0.1)
                         except Exception as e:
@@ -472,12 +706,16 @@ class MessageArchiver(BaseDiscordBot):
                         
                         if processed_messages:
                             # Only increment counter for messages that didn't exist before
-                            pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                            new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                            pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                            ))
+                            new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                             new_message_count += len(new_messages)
                             
                             logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                            self.db.store_messages(processed_messages)
+                            await self._db_operation(
+                                lambda db: db.store_messages(processed_messages)
+                            )
                     except Exception as e:
                         logger.error(f"Failed to store batch: {e}")
                         logger.error(f"Error details: {str(e)}")
@@ -512,12 +750,16 @@ class MessageArchiver(BaseDiscordBot):
                             
                             if processed_messages:
                                 # Only increment counter for messages that didn't exist before
-                                pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                    lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                ))
+                                new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                 new_message_count += len(new_messages)
                                 
                                 logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                                self.db.store_messages(processed_messages)
+                                await self._db_operation(
+                                    lambda db: db.store_messages(processed_messages)
+                                )
                             current_batch = []
                             await asyncio.sleep(0.1)
                         except Exception as e:
@@ -535,18 +777,24 @@ class MessageArchiver(BaseDiscordBot):
                         
                         if processed_messages:
                             # Only increment counter for messages that didn't exist before
-                            pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                            new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                            pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                            ))
+                            new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                             new_message_count += len(new_messages)
                             
                             logger.info(f"Storing batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                            self.db.store_messages(processed_messages)
+                            await self._db_operation(
+                                lambda db: db.store_messages(processed_messages)
+                            )
                     except Exception as e:
                         logger.error(f"Failed to store batch: {e}")
                         logger.error(f"Error details: {str(e)}")
 
             # Get all message dates to check for gaps
-            message_dates = self.db.get_message_dates(channel_id)
+            message_dates = await self._db_operation(
+                lambda db: db.get_message_dates(channel_id)
+            )
             if message_dates:
                 # Filter dates based on cutoff if set
                 if cutoff_date:
@@ -588,12 +836,16 @@ class MessageArchiver(BaseDiscordBot):
                                     
                                     if processed_messages:
                                         # Only increment counter for messages that didn't exist before
-                                        pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                        new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                        pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                            lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                        ))
+                                        new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                         new_message_count += len(new_messages)
                                         
                                         logger.info(f"Storing batch of {len(processed_messages)} messages from gap in #{channel.name} ({len(new_messages)} new)")
-                                        self.db.store_messages(processed_messages)
+                                        await self._db_operation(
+                                            lambda db: db.store_messages(processed_messages)
+                                        )
                                         if gap_message_count % 100 == 0:
                                             logger.info(f"Found {gap_message_count} messages in current gap for #{channel.name}")
                                     
@@ -614,12 +866,16 @@ class MessageArchiver(BaseDiscordBot):
                                 
                                 if processed_messages:
                                     # Only increment counter for messages that didn't exist before
-                                    pre_existing = set(msg['id'] for msg in self.db.get_messages_by_ids([msg['id'] for msg in processed_messages]))
-                                    new_messages = [msg for msg in processed_messages if msg['id'] not in pre_existing]
+                                    pre_existing = set(msg['message_id'] for msg in await self._db_operation(
+                                        lambda db: db.get_messages_by_ids([msg['message_id'] for msg in processed_messages])
+                                    ))
+                                    new_messages = [msg for msg in processed_messages if msg['message_id'] not in pre_existing]
                                     new_message_count += len(new_messages)
                                     
                                     logger.info(f"Storing final gap batch of {len(processed_messages)} messages from #{channel.name} ({len(new_messages)} new)")
-                                    self.db.store_messages(processed_messages)
+                                    await self._db_operation(
+                                        lambda db: db.store_messages(processed_messages)
+                                    )
                             except Exception as e:
                                 logger.error(f"Failed to store batch: {e}")
                                 logger.error(f"Error details: {str(e)}")
@@ -647,193 +903,29 @@ class MessageArchiver(BaseDiscordBot):
             # Don't close the connection here as it's reused across channels
             pass
 
-    async def _process_message(self, message, channel_id):
-        """Process a single message and store it in the database."""
+    def _ensure_db_connection(self):
+        """Ensure database connection is alive and reconnect if needed."""
         try:
-            message_start_time = datetime.now()
-            
-            # Calculate total reaction count and get reactors
-            reaction_count = sum(reaction.count for reaction in message.reactions) if message.reactions else 0
-            reactors = []  # Always initialize as empty list
-            
-            if reaction_count > 0 and message.reactions:
-                reaction_start_time = datetime.now()
-                reactor_ids = set()
-                try:
-                    # Always process reactions in in-depth mode, or if the message is new
-                    if self.in_depth or not self.db.message_exists(message.id):
-                        logger.info(f"Processing reactions for message {message.id}: {len(message.reactions)} types, {reaction_count} total reactions")
-                        
-                        guild = self.get_guild(self.guild_id)
-                        
-                        for reaction in message.reactions:
-                            reaction_process_start = datetime.now()
-                            await self._wait_for_rate_limit()
-                            try:
-                                async for user in reaction.users(limit=50):
-                                    reactor_ids.add(user.id)
-                                    if hasattr(user, 'id') and not self.db.get_member(user.id):
-                                        logger.debug(f"Fetching new member info for reactor {user.id}")
-                                        await self._wait_for_rate_limit()
-                                        member = guild.get_member(user.id) if guild else None
-                                        role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
-                                        guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
-
-                                        self.db.create_or_update_member(
-                                            member_id=user.id,
-                                            username=user.name,
-                                            display_name=getattr(user, 'display_name', None),
-                                            global_name=getattr(user, 'global_name', None),
-                                            avatar_url=str(user.avatar.url) if user.avatar else None,
-                                            discriminator=getattr(user, 'discriminator', None),
-                                            bot=getattr(user, 'bot', False),
-                                            system=getattr(user, 'system', False),
-                                            accent_color=getattr(user, 'accent_color', None),
-                                            banner_url=str(user.banner.url) if getattr(user, 'banner', None) else None,
-                                            discord_created_at=user.created_at.isoformat() if hasattr(user, 'created_at') else None,
-                                            guild_join_date=guild_join_date,
-                                            role_ids=role_ids
-                                        )
-                                    else:
-                                        logger.debug(f"Using cached member info for reactor {user.id}")
-                                    
-                                reaction_process_duration = (datetime.now() - reaction_process_start).total_seconds()
-                                logger.info(f"Processed reaction {reaction} in {reaction_process_duration:.2f}s")
-                            except discord.Forbidden:
-                                logger.warning(f"Missing permissions to fetch reactors for {reaction} on message {message.id}")
-                                continue
-                            except Exception as e:
-                                logger.warning(f"Error fetching users for reaction {reaction} on message {message.id}: {e}")
-                                continue
-                        
-                        reaction_duration = (datetime.now() - reaction_start_time).total_seconds()
-                        if reaction_duration > 2.0:  # Log slow reaction processing
-                            logger.warning(f"Slow reaction processing for message {message.id}: {reaction_duration:.2f}s")
-                        
-                        # Convert reactor_ids to list if we found any
-                        if reactor_ids:
-                            reactors = list(reactor_ids)
-                except Exception as e:
-                    logger.warning(f"Could not fetch reactors for message {message.id}: {e}")
-                
-            # First create or update the member
-            if hasattr(message.author, 'id'):
-                # Get guild member object to access join date and roles
-                guild = self.get_guild(self.guild_id)
-                member = guild.get_member(message.author.id) if guild else None
-                
-                # Only update if we have the member object or this is a new member
-                if member or not self.db.get_member(message.author.id):
-                    role_ids = json.dumps([role.id for role in member.roles]) if member and member.roles else None
-                    guild_join_date = member.joined_at.isoformat() if member and member.joined_at else None
-                    
-                    logger.debug(f"Processing member {message.author.id} ({message.author.name}) from message {message.id}")
-                    logger.debug(f"Member details - display_name: {getattr(message.author, 'display_name', None)}, global_name: {getattr(message.author, 'global_name', None)}")
-                    
-                    self.db.create_or_update_member(
-                        member_id=message.author.id,
-                        username=message.author.name,
-                        display_name=getattr(message.author, 'display_name', None),
-                        global_name=getattr(message.author, 'global_name', None),
-                        avatar_url=str(message.author.avatar.url) if message.author.avatar else None,
-                        discriminator=getattr(message.author, 'discriminator', None),
-                        bot=getattr(message.author, 'bot', False),
-                        system=getattr(message.author, 'system', False),
-                        accent_color=getattr(message.author, 'accent_color', None),
-                        banner_url=str(message.author.banner.url) if getattr(message.author, 'banner', None) else None,
-                        discord_created_at=message.author.created_at.isoformat() if hasattr(message.author, 'created_at') else None,
-                        guild_join_date=guild_join_date,
-                        role_ids=role_ids
-                    )
-                else:
-                    logger.debug(f"Skipping member update for {message.author.id} ({message.author.name}) - no guild member and already exists in DB")
-
-            # Get the actual channel ID and name (use parent forum for threads)
-            actual_channel = message.channel
-            thread_id = None
-            
-            if hasattr(message.channel, 'parent') and message.channel.parent:
-                actual_channel = message.channel.parent
-                # Only set thread_id if it's a regular thread, not a forum post
-                if isinstance(message.channel, discord.Thread) and not hasattr(message.channel, 'thread_type'):
-                    thread_id = message.channel.id
-                    logger.debug(f"Message {message.id} is in a thread. Thread ID: {thread_id}, Parent Channel: {actual_channel.name} (ID: {actual_channel.id})")
-                elif hasattr(message.channel, 'thread_type'):
-                    # For forum posts, use the forum post's channel ID as the channel_id
-                    actual_channel = message.channel
-                    logger.debug(f"Message {message.id} is in a forum post. Forum Channel: {actual_channel.name} (ID: {actual_channel.id})")
-
-            # Then create or update the channel using the appropriate channel info
-            self.db.create_or_update_channel(
-                channel_id=actual_channel.id,
-                channel_name=actual_channel.name,
-                nsfw=getattr(actual_channel, 'nsfw', False)
-            )
-            
-            processed_message = {
-                'id': message.id,
-                'message_id': message.id,
-                'channel_id': actual_channel.id,
-                'author_id': message.author.id,
-                'author': {
-                    'id': message.author.id,
-                    'name': message.author.name,
-                    'display_name': getattr(message.author, 'display_name', None),
-                    'global_name': getattr(message.author, 'global_name', None),
-                    'avatar_url': str(message.author.avatar.url) if message.author.avatar else None,
-                    'discriminator': getattr(message.author, 'discriminator', None),
-                    'bot': getattr(message.author, 'bot', False),
-                    'system': getattr(message.author, 'system', False),
-                    'accent_color': getattr(message.author, 'accent_color', None),
-                    'banner_url': str(message.author.banner.url) if getattr(message.author, 'banner', None) else None,
-                    'discord_created_at': message.author.created_at.isoformat() if hasattr(message.author, 'created_at') else None,
-                    'guild_join_date': guild_join_date,
-                    'role_ids': role_ids
-                },
-                'channel': {
-                    'id': actual_channel.id,
-                    'name': actual_channel.name,
-                    'nsfw': getattr(actual_channel, 'nsfw', False)
-                },
-                'content': message.content,
-                'created_at': message.created_at.isoformat(),
-                'attachments': [
-                    {
-                        'url': attachment.url,
-                        'filename': attachment.filename
-                    } for attachment in message.attachments
-                ],
-                'embeds': [embed.to_dict() for embed in message.embeds],
-                'reaction_count': reaction_count,
-                'reactors': reactors,  # This will be a list, not None
-                'reference_id': message.reference.message_id if message.reference else None,
-                'edited_at': message.edited_at.isoformat() if message.edited_at else None,
-                'is_pinned': message.pinned,
-                'thread_id': thread_id,
-                'message_type': str(message.type),
-                'flags': message.flags.value,
-                'jump_url': message.jump_url
-            }
-            
-            message_duration = (datetime.now() - message_start_time).total_seconds()
-            if message_duration > 3.0:
-                logger.warning(f"Very slow message processing: {message_duration:.2f}s for message {message.id}")
-            
-            return processed_message
-            
+            # Test the connection
+            if not self.db or not self.db.conn:
+                logger.info("Database connection lost, reconnecting...")
+                self.db = DatabaseHandler(self.db_path)
+                self.db._init_db()
+                logger.info("Successfully reconnected to database")
+            else:
+                # Test if connection is actually working
+                self.db.cursor.execute("SELECT 1")
         except Exception as e:
-            logger.error(f"Error processing message {message.id}: {e}")
-            return None
-
-    async def close(self):
-        """Properly close the bot and database connection."""
-        try:
-            if hasattr(self, 'db') and self.db:
-                self.db.close()
-                self.db = None
-            await super().close()
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            logger.warning(f"Database connection test failed, reconnecting: {e}")
+            try:
+                if self.db:
+                    self.db.close()
+                self.db = DatabaseHandler(self.db_path)
+                self.db._init_db()
+                logger.info("Successfully reconnected to database")
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {e}")
+                raise
 
 def main():
     """Main entry point."""
@@ -881,11 +973,9 @@ def main():
     finally:
         # Ensure everything is cleaned up properly
         if bot:
-            if bot.db:
-                bot.db.close()
             if not loop.is_closed():
                 loop.run_until_complete(bot.close())
-            
+
         # Clean up the event loop
         try:
             if not loop.is_closed():
