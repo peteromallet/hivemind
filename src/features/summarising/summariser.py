@@ -1237,25 +1237,22 @@ class ChannelSummarizer(BaseDiscordBot):
     async def _get_production_channels(self, db_handler):
         """Get active channels for production mode"""
         try:
-            channel_query = """
-                SELECT 
-                    c.channel_id,
-                    c.channel_name,
-                    COALESCE(c2.channel_name, 'Unknown') as source,
-                    COUNT(m.message_id) as msg_count
-                FROM channels c
-                LEFT JOIN channels c2 ON c.category_id = c2.channel_id
-                LEFT JOIN messages m ON c.channel_id = m.channel_id
-                    AND m.created_at > datetime('now', '-24 hours')
-                WHERE c.channel_id IN ({})
-                    OR c.category_id IN ({})
-                GROUP BY c.channel_id, c.channel_name, source
-                HAVING COUNT(m.message_id) >= 25
-                ORDER BY msg_count DESC
-            """.format(
-                ",".join((str(cid) for cid in self.channels_to_monitor)),
-                ",".join((str(cid) for cid in self.channels_to_monitor))
-            
+            channel_query = (
+                "SELECT c.channel_id, c.channel_name, COALESCE(c2.channel_name, 'Unknown') as source, "
+                "COUNT(m.message_id) as msg_count "
+                "FROM channels c "
+                "LEFT JOIN channels c2 ON c.category_id = c2.channel_id "
+                "LEFT JOIN messages m ON c.channel_id = m.channel_id "
+                "AND m.created_at > datetime('now', '-24 hours') "
+                "WHERE c.channel_id IN ({}) OR c.category_id IN ({}) "
+                "GROUP BY c.channel_id, c.channel_name, source "
+                "HAVING COUNT(m.message_id) >= 25 "
+                "ORDER BY msg_count DESC"
+            ).format(
+                ",".join(str(cid) for cid in self.channels_to_monitor),
+                ",".join(str(cid) for cid in self.channels_to_monitor)
+            )
+        
             loop = asyncio.get_running_loop()
             def db_operation():
                 try:
