@@ -1337,6 +1337,9 @@ class ChannelSummarizer(BaseDiscordBot):
             self.logger.error(f"Error registering events: {e}")
             self.logger.error(traceback.format_exc())
 
+    def _get_today_str(self):
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
 if __name__ == "__main__":
     def main():
         pass

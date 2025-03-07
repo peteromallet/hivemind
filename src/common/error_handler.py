@@ -33,7 +33,7 @@ def handle_errors(operation_name: str):
     return decorator
 
 class ErrorHandler:
-    def __init__(self, bot: Optional[discord.Client] = None):
+    def __init__(self, bot: Optional[discord.Client] = None, *args, **kwargs):
         self.bot = bot
         self.logger = logging.getLogger('DiscordBot')
         
