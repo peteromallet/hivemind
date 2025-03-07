@@ -705,14 +705,21 @@ class ArtCurator(BaseDiscordBot):
                     except discord.Forbidden:
                         self.logger.warning(f"Couldn't DM original poster {author}.")
                 else:
-                    await user.send("Empty reason provided. Post will not be deleted.")
-                    await message.remove_reaction('❌', user)
-                    self.logger.warning(f"Empty reason provided by {user.name}. Reaction removed.")
+                    try:
+                        await message.remove_reaction('❌', user)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove reaction for empty reason: {e}")
+                    else:
+                        self.logger.warning(f"Empty reason provided by {user.name}. Reaction removed.")
                 
             except asyncio.TimeoutError:
                 await user.send("No reason provided within 5 minutes. Post will not be deleted.")
-                await message.remove_reaction('❌', user)
-                self.logger.warning(f"Curator {user.name} did not provide a reason in time.")
+                try:
+                    await message.remove_reaction('❌', user)
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove reaction on timeout for {user.name}: {e}")
+                else:
+                    self.logger.warning(f"Curator {user.name} did not provide a reason in time.")
                 
         except discord.Forbidden:
             self.logger.error(f"Couldn't DM curator {user.name}.")
