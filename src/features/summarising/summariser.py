@@ -292,7 +292,8 @@ class ChannelSummarizer(BaseDiscordBot):
             self.attachment_handler = AttachmentHandler()
             self.message_formatter = MessageFormatter()
             self.db = DatabaseHandler(dev_mode=dev_mode)
-            self.error_handler = ErrorHandler()
+            self.error_handler = ErrorHandler(self)
+            self.log_handler = LogHandler()
             
             # --- New: Instantiate the summarizer for queries to Claude, etc. ---
             # We remove direct Anthropic usage from here. 
@@ -452,7 +453,7 @@ class ChannelSummarizer(BaseDiscordBot):
                 return
             
             admin_user = await self.fetch_user(int(os.getenv('ADMIN_USER_ID')))
-            self.error_handler = ErrorHandler(notification_channel, admin_user)
+            self.error_handler = ErrorHandler(self)
             self.logger.info(f"Successfully initialized with summary channel: {notification_channel.name}")
             
         except Exception as e:
@@ -1159,26 +1160,22 @@ class ChannelSummarizer(BaseDiscordBot):
                 self.logger.error("DEV_CHANNELS_TO_MONITOR not set or empty in environment")
                 return []
 
-            channel_query = """
-                SELECT 
-                    c.channel_id,
-                    c.channel_name,
-                    COALESCE(c2.channel_name, 'Unknown') as source,
-                    COUNT(m.message_id) as msg_count
-                FROM channels c
-                LEFT JOIN channels c2 ON c.category_id = c2.channel_id
-                LEFT JOIN messages m ON c.channel_id = m.channel_id
-                    AND m.created_at > datetime('now', '-24 hours')
-                WHERE c.channel_id IN ({})
-                    OR c.category_id IN ({})
-                GROUP BY c.channel_id, c.channel_name, source
-                HAVING COUNT(m.message_id) >= 25
-                ORDER BY msg_count DESC
-            """.format(
-                ",".join((str(cid) for cid in test_channel_ids)),
-                ",".join((str(cid) for cid in test_channel_ids))
+            # Replacing the channel_query assignment to fix linter errors
+            channel_query = (
+                "SELECT c.channel_id, c.channel_name, COALESCE(c2.channel_name, 'Unknown') as source, "
+                "COUNT(m.message_id) as msg_count "
+                "FROM channels c "
+                "LEFT JOIN channels c2 ON c.category_id = c2.channel_id "
+                "LEFT JOIN messages m ON c.channel_id = m.channel_id "
+                "AND m.created_at > datetime('now', '-24 hours') "
+                "WHERE c.channel_id IN ({}) OR c.category_id IN ({}) "
+                "GROUP BY c.channel_id, c.channel_name, source "
+                "HAVING COUNT(m.message_id) >= 25 "
+                "ORDER BY msg_count DESC"
+            ).format(
+                ",".join(str(cid) for cid in test_channel_ids),
+                ",".join(str(cid) for cid in test_channel_ids)
             )
-            
             loop = asyncio.get_running_loop()
             def db_operation():
                 try:
@@ -1258,8 +1255,7 @@ class ChannelSummarizer(BaseDiscordBot):
             """.format(
                 ",".join((str(cid) for cid in self.channels_to_monitor)),
                 ",".join((str(cid) for cid in self.channels_to_monitor))
-            )
-
+            
             loop = asyncio.get_running_loop()
             def db_operation():
                 try:
