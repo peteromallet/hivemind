@@ -62,3 +62,9 @@ local_settings.py
 
 # New file
 channel_descriptions.json
+
+# Docker related files
+Dockerfile*
+docker-compose*.yml
+.docker
+.dockerignore
