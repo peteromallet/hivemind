@@ -1236,45 +1236,10 @@ class ChannelSummarizer(BaseDiscordBot):
             return []
 
     async def setup_discord(self):
-        """Initialize Discord connection and event handlers."""
-        try:
-            @self.discord_client.event
-            async def on_disconnect():
-                try:
-                    self.logger.warning("Discord client disconnected. Attempting to reconnect in 5 seconds...")
-                    await asyncio.sleep(5)
-                    
-                    loop = asyncio.get_running_loop()
-                    
-                    await self.discord_client.close()
-                    
-                    intents = discord.Intents.default()
-                    intents.message_content = True
-                    intents.guilds = True
-                    intents.messages = True
-                    intents.members = True
-                    intents.presences = True
-                    
-                    self.discord_client = commands.Bot(
-                        command_prefix="!",
-                        intents=intents,
-                        heartbeat_timeout=60.0,
-                        guild_ready_timeout=10.0,
-                        gateway_queue_size=512,
-                        loop=loop
-                    )
-                    
-                    await self.setup_discord()
-                    
-                    await self.discord_client.start(self.discord_token)
-                    self.logger.info("Reconnection successful")
-                except Exception as e:
-                    self.logger.error(f"Error during reconnection: {e}")
-                    self.logger.error(traceback.format_exc())
-        except Exception as e:
-            self.logger.error(f"Error in setup_discord: {e}")
-            self.logger.error(traceback.format_exc())
-
+        """Initialize Discord connection and event handlers using discord.py's built-in reconnect logic."""
+        self.logger.info("Using discord.py built-in reconnection mechanism. No custom on_disconnect handler registered.")
+        # Note: discord.py will automatically handle reconnection as needed.
+        
     def register_events(self):
         """Register event handlers for the bot."""
         try:

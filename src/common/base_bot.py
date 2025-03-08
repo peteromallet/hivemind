@@ -19,17 +19,9 @@ class BaseDiscordBot(commands.Bot):
         self._connection_healthy: bool = False
         self._heartbeat_timeout: float = 60.0
         self._health_check_task: Optional[asyncio.Task] = None
-        self._reconnecting: bool = False
         self._last_health_check: datetime = datetime.now()
         self._health_check_lock: asyncio.Lock = asyncio.Lock()
         self._state_lock: asyncio.Lock = asyncio.Lock()
-        
-        # Connection attempt tracking
-        self._connection_history: Deque[datetime] = deque(maxlen=100)
-        self._connection_window: timedelta = timedelta(hours=1)
-        self._max_connections_per_hour: int = 45
-        self._reconnect_delay: float = 1.0
-        self._max_reconnect_delay: float = 300.0
         
         # Session management
         self._last_session_id: Optional[str] = None
@@ -127,83 +119,13 @@ class BaseDiscordBot(commands.Bot):
             self.logger.debug(traceback.format_exc())
             raise
 
-    async def _attempt_reconnect(self):
-        """Handle reconnection with backoff."""
-        try:
-            self.logger.warning("Connection unhealthy, attempting reconnect")
-            await self._add_connection_attempt()
-            
-            # Calculate delay based on failed attempts
-            async with self._state_lock:
-                delay = min(self._reconnect_delay * (2 ** self._failed_session_count), self._max_reconnect_delay)
-            
-            if delay > 1.0:
-                self.logger.info(f"Waiting {delay:.1f}s before reconnecting")
-                await asyncio.sleep(delay)
-            
-            # Properly handle reconnection
-            try:
-                # First close outside of state lock to avoid deadlocks
-                if not self.is_closed():
-                    await self.close()
-                
-                # Recreate HTTP session if needed
-                if not hasattr(self.http, '_session') or self.http._session is None:
-                    await self.http.create_session()
-                
-                # Attempt to reconnect
-                await self.connect(reconnect=True)
-                
-                async with self._state_lock:
-                    self._reconnect_delay = 1.0  # Reset delay on successful connection
-                return True
-                    
-            except Exception as e:
-                self.logger.error(f"Failed to reconnect: {str(e)}")
-                self.logger.debug(traceback.format_exc())
-                async with self._state_lock:
-                    self._reconnect_delay = delay  # Keep the delay for next attempt
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Error during reconnect attempt: {str(e)}")
-            self.logger.debug(traceback.format_exc())
-            return False
-
     async def _run_health_checks(self):
-        """Run periodic health checks."""
+        """Run periodic health checks and log unhealthy connection but rely on discord.py's built-in reconnect mechanism."""
         while not self.is_closed():
             try:
                 await asyncio.sleep(30)  # Check every 30 seconds
-                
-                async with self._state_lock:
-                    # Skip if we're already reconnecting or had a recent health check
-                    if self._reconnecting or (datetime.now() - self._last_health_check).total_seconds() < 30:
-                        continue
-                    
-                    self._last_health_check = datetime.now()
-                    
-                    # Release lock while checking health to avoid deadlocks
-                    is_healthy = await self._is_connection_healthy()
-                    if not is_healthy:
-                        connection_count = await self._get_connection_count()
-                        if connection_count >= self._max_connections_per_hour:
-                            self.logger.error(f"Too many reconnection attempts ({connection_count}) in the past hour")
-                            continue
-                            
-                        self._reconnecting = True
-                
-                # Attempt reconnect outside the lock
-                if not is_healthy and self._reconnecting:
-                    try:
-                        if await self._attempt_reconnect():
-                            self.logger.info("Reconnection successful")
-                        else:
-                            self.logger.warning("Reconnection failed, will retry later")
-                    finally:
-                        async with self._state_lock:
-                            self._reconnecting = False
-                            
+                if not await self._is_connection_healthy():
+                    self.logger.warning("Connection appears unhealthy. Relying on discord.py's built-in reconnect mechanism.")
             except asyncio.CancelledError:
                 break
             except Exception as e:
