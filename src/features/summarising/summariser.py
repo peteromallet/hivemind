@@ -542,6 +542,7 @@ class ChannelSummarizer(BaseDiscordBot):
             self.logger.debug(traceback.format_exc())
             return []
 
+    @handle_errors("safe_send_message")
     async def safe_send_message(self, channel, content=None, embed=None, file=None, files=None, reference=None):
         """Safely send a message with concurrency-limited retry logic."""
         try:
@@ -852,6 +853,7 @@ class ChannelSummarizer(BaseDiscordBot):
         
         return None
 
+    @handle_errors("_execute_db_operation")
     async def _execute_db_operation(self, operation, *args, db_handler=None):
         """Execute a database operation in a thread pool to avoid blocking the event loop."""
         loop = asyncio.get_running_loop()
@@ -922,6 +924,7 @@ class ChannelSummarizer(BaseDiscordBot):
             self.logger.debug(traceback.format_exc())
             return False
 
+    @handle_errors("generate_summary")
     async def generate_summary(self):
         """
         Generate and post summaries following these steps:
@@ -1144,94 +1147,42 @@ class ChannelSummarizer(BaseDiscordBot):
     async def _get_dev_mode_channels(self, db_handler):
         """Get active channels for dev mode"""
         try:
-            test_channels_str = os.getenv('TEST_DATA_CHANNEL')
-            if not test_channels_str:
-                self.logger.error("TEST_DATA_CHANNEL not set in environment")
-                return []
-            
-            test_channel_ids = [int(cid.strip()) for cid in test_channels_str.split(',') if cid.strip()]
+            test_channel_ids = [int(cid.strip()) for cid in os.getenv('DEV_CHANNELS_TO_MONITOR', '').split(',') if cid.strip()]
             if not test_channel_ids:
-                self.logger.error("No valid channel IDs found in TEST_DATA_CHANNEL")
+                self.logger.warning("No test channels configured")
                 return []
-
-            # Retrieve DEV_CHANNELS_TO_MONITOR from already loaded configuration
-            dev_channels = self.dev_channels_to_monitor
-            if not dev_channels:
-                self.logger.error("DEV_CHANNELS_TO_MONITOR not set or empty in environment")
-                return []
-
-            # Replacing the channel_query assignment to fix linter errors
-            channel_query = (
-                "SELECT c.channel_id, c.channel_name, COALESCE(c2.channel_name, 'Unknown') as source, "
-                "COUNT(m.message_id) as msg_count "
-                "FROM channels c "
-                "LEFT JOIN channels c2 ON c.category_id = c2.channel_id "
-                "LEFT JOIN messages m ON c.channel_id = m.channel_id "
-                "AND m.created_at > datetime('now', '-24 hours') "
-                "WHERE c.channel_id IN ({}) OR c.category_id IN ({}) "
-                "GROUP BY c.channel_id, c.channel_name, source "
-                "HAVING COUNT(m.message_id) >= 25 "
-                "ORDER BY msg_count DESC"
-            ).format(
+                
+            self.logger.debug(f"Test channel IDs: {test_channel_ids}")
+            
+            query = """
+                SELECT DISTINCT channel_id, channel_name
+                FROM messages
+                WHERE channel_id IN ({})
+                AND channel_id IN ({})
+            """.format(
                 ",".join(str(cid) for cid in test_channel_ids),
-                ",".join(str(cid) for cid in test_channel_ids)
-            )
+                ",".join(str(cid) for cid in test_channel_ids))
+            
             loop = asyncio.get_running_loop()
-            def db_operation():
-                try:
-                    db_handler.conn.execute("PRAGMA busy_timeout = 5000")
-                    db_handler.conn.row_factory = sqlite3.Row
-                    cursor = db_handler.conn.cursor()
-                    cursor.execute(channel_query)
-                    results = [dict(row) for row in cursor.fetchall()]
-                    cursor.close()
-                    db_handler.conn.row_factory = None
-
-                    # Begin mapping: override each result's post_channel_id based on DEV_CHANNELS_TO_MONITOR
-                    if dev_channels:
-                        if len(dev_channels) == len(test_channel_ids):
-                            # Map by index: for each result, find its index in test_channel_ids and assign corresponding dev channel
-                            for result in results:
-                                try:
-                                    idx = test_channel_ids.index(result['channel_id'])
-                                    result['post_channel_id'] = dev_channels[idx]
-                                except ValueError:
-                                    result['post_channel_id'] = dev_channels[0]
-                        elif len(dev_channels) == 1:
-                            for result in results:
-                                result['post_channel_id'] = dev_channels[0]
-                        else:
-                            # In case multiple dev channels exist but count doesn't match, default to first one
-                            for result in results:
-                                result['post_channel_id'] = dev_channels[0]
-                    else:
-                        for result in results:
-                            result['post_channel_id'] = result['channel_id']
-
-                    return results
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e):
-                        self.logger.error("Database lock timeout exceeded")
-                    else:
-                        self.logger.error(f"Database operational error: {e}")
-                    return []
-                except Exception as e:
-                    self.logger.error(f"Error getting active channels: {e}")
-                    return []
-
             try:
+                def db_operation():
+                    try:
+                        cursor = db_handler.execute_query(query)
+                        results = cursor.fetchall()
+                        return [(row[0], row[1]) for row in results]
+                    except Exception as e:
+                        self.logger.error(f"Error in dev channel query: {e}")
+                        return []
+                        
                 return await asyncio.wait_for(
                     loop.run_in_executor(None, db_operation),
                     timeout=10
                 )
-            except asyncio.TimeoutError:
-                self.logger.error("Timeout while executing database query")
-                return []
             except Exception as e:
-                self.logger.error(f"Error executing database query: {e}")
+                self.logger.error(f"Error executing query: {e}")
                 return []
         except Exception as e:
-            self.logger.error(f"Error getting active channels: {e}")
+            self.logger.error(f"Error getting dev channels: {e}")
             return []
 
     async def _get_production_channels(self, db_handler):
@@ -1252,7 +1203,7 @@ class ChannelSummarizer(BaseDiscordBot):
                 ",".join(str(cid) for cid in self.channels_to_monitor),
                 ",".join(str(cid) for cid in self.channels_to_monitor)
             )
-        
+            
             loop = asyncio.get_running_loop()
             def db_operation():
                 try:
@@ -1273,20 +1224,15 @@ class ChannelSummarizer(BaseDiscordBot):
                 except Exception as e:
                     self.logger.error(f"Error getting active channels: {e}")
                     return []
-
-            try:
-                return await asyncio.wait_for(
-                    loop.run_in_executor(None, db_operation),
-                    timeout=10
-                )
-            except asyncio.TimeoutError:
-                self.logger.error("Timeout while executing database query")
-                return []
-            except Exception as e:
-                self.logger.error(f"Error executing database query: {e}")
-                return []
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, db_operation),
+                timeout=10
+            )
+        except asyncio.TimeoutError:
+            self.logger.error("Timeout while executing database query")
+            return []
         except Exception as e:
-            self.logger.error(f"Error getting active channels: {e}")
+            self.logger.error(f"Error executing database query: {e}")
             return []
 
     async def setup_discord(self):

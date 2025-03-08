@@ -40,37 +40,13 @@ INITIAL_RETRY_DELAY = 3600  # 1 hour
 MAX_RETRY_WAIT = 24 * 3600  # 24 hours in seconds
 HEARTBEAT_CHECK_INTERVAL = 30  # Check connection every 30 seconds
 
-async def monitor_connection(bot):
-    """Monitor bot connection and heartbeat."""
-    while True:
-        try:
-            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
-            
-            if not bot.is_ready() or not bot._last_heartbeat:
-                continue
-                
-            # Check if we've missed too many heartbeats
-            time_since_heartbeat = (datetime.utcnow() - bot._last_heartbeat).total_seconds()
-            if time_since_heartbeat > 60:  # No heartbeat for 60 seconds
-                bot.logger.warning(f"No heartbeat received for {time_since_heartbeat:.1f}s")
-                # Let discord.py's internal reconnect handle it
-                if bot.ws:
-                    await bot.ws.close(code=1001)
-                    
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            bot.logger.error(f"Error in connection monitor: {e}")
-            bot.logger.debug(traceback.format_exc())
-
 async def run_summarizer(bot, token, run_now):
     """Run the summarizer bot with optional immediate summary generation"""
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create tasks for bot connection and monitoring
+            # Create task for bot connection only
             bot_task = asyncio.create_task(bot.start(token))
-            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -89,7 +65,7 @@ async def run_summarizer(bot, token, run_now):
                 await bot.cleanup()  # Clean up resources
                 await bot.close()  # Close the bot
                 bot_task.cancel()  # Cancel the bot task
-                await cleanup_tasks([bot_task])  # Clean up the task
+                await cleanup_tasks([bot_task])
             else:
                 bot.logger.info("Starting scheduled mode...")
                 bot._shutdown_flag = False  # Ensure shutdown flag is False for scheduled mode
@@ -135,9 +111,8 @@ async def run_curator(bot, token):
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create tasks for bot connection and monitoring
+            # Create task for bot connection
             bot_task = asyncio.create_task(bot.start(token))
-            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -147,9 +122,21 @@ async def run_curator(bot, token):
                 await asyncio.sleep(1)
                 
             bot.logger.info("Curator bot is ready and fully connected")
-                
-            # Wait for the bot task to complete or be cancelled
-            await asyncio.gather(bot_task, monitor_task)
+            
+            # Create done, pending sets for task management
+            done, pending = await asyncio.wait(
+                [bot_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Ensure proper cleanup
+            await cleanup_tasks(pending)
+            
+            # Check for exceptions
+            for task in done:
+                if task.exception():
+                    raise task.exception()
+            
             return  # Success - exit the retry loop
                 
         except (TimeoutError, discord.errors.DiscordServerError) as e:
@@ -162,7 +149,7 @@ async def run_curator(bot, token):
             await asyncio.sleep(wait_time)
         except Exception as e:
             bot.logger.error(f"Error running curator bot: {e}")
-            traceback.print_exc()
+            bot.logger.debug(traceback.format_exc())
             raise
 
 async def schedule_daily_summary(bot):
@@ -228,9 +215,8 @@ async def run_logger(bot, token):
     retry_count = 0
     while retry_count < MAX_RETRIES:
         try:
-            # Create tasks for bot connection and monitoring
+            # Create task for bot connection
             bot_task = asyncio.create_task(bot.start(token))
-            monitor_task = asyncio.create_task(monitor_connection(bot))
             
             # Wait for bot to be ready
             start_time = time.time()
@@ -240,9 +226,21 @@ async def run_logger(bot, token):
                 await asyncio.sleep(1)
                 
             bot.logger.info("Logger bot is ready and fully connected")
-                
-            # Wait for the bot task to complete or be cancelled
-            await asyncio.gather(bot_task, monitor_task)
+            
+            # Create done, pending sets for task management
+            done, pending = await asyncio.wait(
+                [bot_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Ensure proper cleanup
+            await cleanup_tasks(pending)
+            
+            # Check for exceptions
+            for task in done:
+                if task.exception():
+                    raise task.exception()
+            
             return  # Success - exit the retry loop
                 
         except (TimeoutError, discord.errors.DiscordServerError) as e:
@@ -255,11 +253,12 @@ async def run_logger(bot, token):
             await asyncio.sleep(wait_time)
         except Exception as e:
             bot.logger.error(f"Error running logger bot: {e}")
-            traceback.print_exc()
+            bot.logger.debug(traceback.format_exc())
             raise
 
 async def run_all_bots(curator_bot, summarizer_bot, logger_bot, token, run_now, logger):
-    """Run all bots concurrently"""
+    """Run all bots concurrently with improved error handling"""
+    bot_tasks = []
     try:
         # Create tasks for all bots
         curator_task = asyncio.create_task(
@@ -272,28 +271,27 @@ async def run_all_bots(curator_bot, summarizer_bot, logger_bot, token, run_now, 
             run_logger(logger_bot, token)
         )
         
+        bot_tasks = [curator_task, summarizer_task, logger_task]
+        
+        # Log startup
+        logger.info("Starting all bots...")
         curator_bot.logger.info("Starting curator bot")
         summarizer_bot.logger.info("Starting summarizer bot")
         logger_bot.logger.info("Starting logger bot")
         
-        # Wait for logger bot to be ready
-        start_time = time.time()
-        while not logger_bot.is_ready():
-            if time.time() - start_time > READY_TIMEOUT:
-                raise TimeoutError("Logger bot failed to become ready within timeout period")
-            await asyncio.sleep(1)
-            
         # Wait for any task to complete (or fail)
         done, pending = await asyncio.wait(
-            [curator_task, summarizer_task, logger_task],
+            bot_tasks,
             return_when=asyncio.FIRST_COMPLETED
         )
         
-        # If one bot fails, cancel the others and raise the exception
+        # Check for exceptions and log appropriately
         for task in done:
             try:
                 await task
             except Exception as e:
+                logger.error(f"Bot task failed: {str(e)}")
+                logger.debug(traceback.format_exc())
                 # Cancel remaining tasks
                 await cleanup_tasks(pending)
                 raise
@@ -302,10 +300,16 @@ async def run_all_bots(curator_bot, summarizer_bot, logger_bot, token, run_now, 
         await cleanup_tasks(pending)
         
     except Exception as e:
-        curator_bot.logger.error(f"Error in bot operation: {e}")
-        summarizer_bot.logger.error(f"Error in bot operation: {e}")
-        logger_bot.logger.error(f"Error in bot operation: {e}")
+        logger.error(f"Critical error in bot operation: {str(e)}")
+        logger.debug(traceback.format_exc())
+        # Ensure all tasks are cleaned up
+        for task in bot_tasks:
+            if not task.done():
+                task.cancel()
         raise
+    finally:
+        # Log shutdown
+        logger.info("All bots shutting down...")
 
 def main():
     # Parse command line arguments

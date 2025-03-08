@@ -5,6 +5,7 @@ import logging
 from collections import deque
 import traceback
 from typing import Optional, Deque, Any, Dict
+import os
 
 class BaseDiscordBot(commands.Bot):
     """Base class for all Discord bots with connection monitoring."""
@@ -282,4 +283,16 @@ class BaseDiscordBot(commands.Bot):
             if self._last_session_id:
                 self.logger.info(f"Session ID: {self._last_session_id}, Connected since: {self._session_start_time}")
             self._connection_healthy = True
-            self._last_heartbeat = datetime.now() 
+            self._last_heartbeat = datetime.now()
+            
+            # Initialize error handler
+            from src.common.error_handler import ErrorHandler
+            self.error_handler = ErrorHandler(self)
+            
+            # Fetch admin user to verify we can send notifications
+            try:
+                admin_id = int(os.getenv('ADMIN_USER_ID'))
+                admin_user = await self.fetch_user(admin_id)
+                self.logger.info(f"Successfully connected and can notify admin: {admin_user.name}")
+            except Exception as e:
+                self.logger.error(f"Failed to verify admin notification capability: {e}") 

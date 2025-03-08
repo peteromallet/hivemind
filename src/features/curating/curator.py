@@ -9,6 +9,7 @@ import json
 from src.common.db_handler import DatabaseHandler
 import datetime
 from src.common.base_bot import BaseDiscordBot
+from src.common.error_handler import handle_errors
 
 class ArtCurator(BaseDiscordBot):
     def __init__(self, logger=None, dev_mode=False):
@@ -538,6 +539,7 @@ class ArtCurator(BaseDiscordBot):
             self.logger.error(f'Error in {event}:', exc_info=True)
             traceback.print_exc()
 
+    @handle_errors("_handle_curator_rejection")
     async def _handle_curator_rejection(self, message, user):
         """Handle the rejection process when a curator reacts with X"""
         # Check if curator is already processing a rejection
@@ -728,6 +730,7 @@ class ArtCurator(BaseDiscordBot):
             # Make sure we remove the curator from active rejections even if there's an error
             self._active_rejections.remove(user.id)
 
+    @handle_errors("_check_thread_activity")
     async def _check_thread_activity(self, thread, original_message):
         """Check if a thread has any activity after 30 minutes and delete if inactive."""
         try:

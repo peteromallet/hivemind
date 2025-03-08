@@ -9,6 +9,7 @@ import traceback  # Add at top of file with other imports
 from src.common.db_handler import DatabaseHandler
 from dotenv import load_dotenv
 from src.common.base_bot import BaseDiscordBot
+from src.common.error_handler import handle_errors
 
 logger = logging.getLogger('MessageLogger')
 
@@ -147,6 +148,7 @@ class MessageLogger(BaseDiscordBot):
         logger.info(f"Logged in as {self.user.name} ({self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guilds")
 
+    @handle_errors("on_message")
     async def on_message(self, message: discord.Message):
         """Called when a message is sent in any channel the bot can see."""
         try:
@@ -211,6 +213,7 @@ class MessageLogger(BaseDiscordBot):
         except Exception as e:
             logger.error(f"Error handling message deletion: {e}")
 
+    @handle_errors("on_reaction_add")
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
         """Called when a reaction is added to a message."""
         try:
